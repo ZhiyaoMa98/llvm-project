@@ -2454,6 +2454,51 @@ static uint32_t alignToARMConstant(uint32_t Value) {
   return Value;
 }
 
+/// Load the 32-bit immediate value into a register using
+/// thumb1 shift and add instructions.
+static void thumb1LoadImm32(MachineBasicBlock *MBB, DebugLoc &DL,
+                            const ARMBaseInstrInfo &TII, unsigned Reg,
+                            uint32_t Imm) {
+  bool LeadZeroFinish = false;
+
+  // Load the immediate value to the register, one byte
+  // at a time.
+  for (int BytePosition = 3; BytePosition >= 0; --BytePosition) {
+    uint32_t ByteMask = 0xff << (BytePosition * 8);
+    if (LeadZeroFinish) {
+      BuildMI(MBB, DL, TII.get(ARM::tLSLri), Reg)
+          .add(condCodeOp())
+          .addReg(Reg)
+          .addImm(8)
+          .add(predOps(ARMCC::AL));
+    }
+    if (uint32_t MaskedByte = (Imm & ByteMask)) {
+      MaskedByte >>= BytePosition * 8;
+      if (!LeadZeroFinish) {
+        LeadZeroFinish = true;
+        BuildMI(MBB, DL, TII.get(ARM::tMOVi8), Reg)
+            .add(condCodeOp())
+            .addImm(MaskedByte)
+            .add(predOps(ARMCC::AL));
+      } else {
+        BuildMI(MBB, DL, TII.get(ARM::tADDi8), Reg)
+            .add(condCodeOp())
+            .addReg(Reg)
+            .addImm(MaskedByte)
+            .add(predOps(ARMCC::AL));
+      }
+    }
+  }
+
+  // The immediate value is zero.
+  if (!LeadZeroFinish) {
+    BuildMI(MBB, DL, TII.get(ARM::tMOVi8), Reg)
+        .add(condCodeOp())
+        .addImm(0)
+        .add(predOps(ARMCC::AL));
+  }
+}
+
 // The stack limit in the TCB is set to this many bytes above the actual
 // stack limit.
 static const uint64_t kSplitStackAvailable = 256;
@@ -2488,6 +2533,7 @@ void ARMFrameLowering::adjustForSegmentedStacks(
   unsigned CFIIndex;
   const ARMSubtarget *ST = &MF.getSubtarget<ARMSubtarget>();
   bool Thumb = ST->isThumb();
+  bool Thumb2 = ST->isThumb2();
 
   // Sadly, this currently doesn't support varargs, platforms other than
   // android/linux. Note that thumb1/thumb2 are support for android/linux.
@@ -2630,11 +2676,27 @@ void ARMFrameLowering::adjustForSegmentedStacks(
 
   // sub SR1, sp, #StackSize
   if (!CompareStackPointer && Thumb) {
-    BuildMI(McrMBB, DL, TII.get(ARM::tSUBi8), ScratchReg1)
-        .add(condCodeOp())
-        .addReg(ScratchReg1)
-        .addImm(AlignedStackSize)
-        .add(predOps(ARMCC::AL));
+    if (AlignedStackSize < 256) {
+      BuildMI(McrMBB, DL, TII.get(ARM::tSUBi8), ScratchReg1)
+          .add(condCodeOp())
+          .addReg(ScratchReg1)
+          .addImm(AlignedStackSize)
+          .add(predOps(ARMCC::AL));
+    } else {
+      if (Thumb2) {
+        BuildMI(McrMBB, DL, TII.get(ARM::t2MOVCCi32imm), ScratchReg0)
+            .add(condCodeOp())
+            .addImm(AlignedStackSize)
+            .add(predOps(ARMCC::AL));
+      } else {
+        thumb1LoadImm32(McrMBB, DL, TII, ScratchReg0, AlignedStackSize);
+      }
+      BuildMI(McrMBB, DL, TII.get(ARM::tSUBrr), ScratchReg1)
+          .add(condCodeOp())
+          .addReg(ScratchReg1)
+          .addReg(ScratchReg0)
+          .add(predOps(ARMCC::AL));
+    }
   } else if (!CompareStackPointer) {
     BuildMI(McrMBB, DL, TII.get(ARM::SUBri), ScratchReg1)
         .addReg(ARM::SP)
@@ -2707,23 +2769,47 @@ void ARMFrameLowering::adjustForSegmentedStacks(
   // Pass first argument for the __morestack by Scratch Register #0.
   //   The amount size of stack required
   if (Thumb) {
-    BuildMI(AllocMBB, DL, TII.get(ARM::tMOVi8), ScratchReg0)
-        .add(condCodeOp())
-        .addImm(AlignedStackSize)
-        .add(predOps(ARMCC::AL));
+    if (AlignedStackSize < 256) {
+      BuildMI(AllocMBB, DL, TII.get(ARM::tMOVi8), ScratchReg0)
+          .add(condCodeOp())
+          .addImm(AlignedStackSize)
+          .add(predOps(ARMCC::AL));
+    } else {
+      if (Thumb2) {
+        BuildMI(AllocMBB, DL, TII.get(ARM::t2MOVCCi32imm), ScratchReg0)
+            .add(condCodeOp())
+            .addImm(AlignedStackSize)
+            .add(predOps(ARMCC::AL));
+      } else {
+        thumb1LoadImm32(AllocMBB, DL, TII, ScratchReg0, AlignedStackSize);
+      }
+    }
   } else {
     BuildMI(AllocMBB, DL, TII.get(ARM::MOVi), ScratchReg0)
         .addImm(AlignedStackSize)
         .add(predOps(ARMCC::AL))
         .add(condCodeOp());
   }
+
   // Pass second argument for the __morestack by Scratch Register #1.
   //   The amount size of stack consumed to save function arguments.
   if (Thumb) {
-    BuildMI(AllocMBB, DL, TII.get(ARM::tMOVi8), ScratchReg1)
-        .add(condCodeOp())
-        .addImm(alignToARMConstant(ARMFI->getArgumentStackSize()))
-        .add(predOps(ARMCC::AL));
+    if (ARMFI->getArgumentStackSize() < 256) {
+      BuildMI(AllocMBB, DL, TII.get(ARM::tMOVi8), ScratchReg1)
+          .add(condCodeOp())
+          .addImm(alignToARMConstant(ARMFI->getArgumentStackSize()))
+          .add(predOps(ARMCC::AL));
+    } else {
+      if (Thumb2) {
+        BuildMI(AllocMBB, DL, TII.get(ARM::t2MOVCCi32imm), ScratchReg1)
+            .add(condCodeOp())
+            .addImm(alignToARMConstant(ARMFI->getArgumentStackSize()))
+            .add(predOps(ARMCC::AL));
+      } else {
+        thumb1LoadImm32(AllocMBB, DL, TII, ScratchReg1,
+                        alignToARMConstant(ARMFI->getArgumentStackSize()));
+      }
+    }
   } else {
     BuildMI(AllocMBB, DL, TII.get(ARM::MOVi), ScratchReg1)
         .addImm(alignToARMConstant(ARMFI->getArgumentStackSize()))
