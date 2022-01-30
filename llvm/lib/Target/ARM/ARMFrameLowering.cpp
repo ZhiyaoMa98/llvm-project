@@ -2539,7 +2539,8 @@ void ARMFrameLowering::adjustForSegmentedStacks(
   // android/linux. Note that thumb1/thumb2 are support for android/linux.
   if (MF.getFunction().isVarArg())
     report_fatal_error("Segmented stacks do not support vararg functions.");
-  if (!ST->isTargetAndroid() && !ST->isTargetLinux())
+  if (!ST->isTargetAndroid() && !ST->isTargetLinux()
+      && !(ST->isTargetAEABI() && ST->isRWPI()))
     report_fatal_error("Segmented stacks not supported on this platform.");
 
   MachineFrameInfo &MFI = MF.getFrameInfo();
@@ -2626,6 +2627,11 @@ void ARMFrameLowering::adjustForSegmentedStacks(
   // When the frame size is less than 256 we just compare the stack
   // boundary directly to the value of the stack pointer, per gcc.
   bool CompareStackPointer = AlignedStackSize < kSplitStackAvailable;
+
+  // But we disable this for ARM MCUs because we want to make each
+  // stacklet very small.
+  if (ST->isTargetAEABI() && ST->isRWPI())
+    CompareStackPointer = false;
 
   // We will use two of the callee save registers as scratch registers so we
   // need to save those registers onto the stack.
@@ -2721,6 +2727,12 @@ void ARMFrameLowering::adjustForSegmentedStacks(
     BuildMI(GetMBB, DL, TII.get(ARM::tLDRi), ScratchReg0)
         .addReg(ScratchReg0)
         .addImm(0)
+        .add(predOps(ARMCC::AL));
+  } else if (Thumb && ST->isThumb2() && ST->isRWPI()) {
+    // ldr SR0, [R9, #-4]
+    BuildMI(GetMBB, DL, TII.get(ARM::t2LDRi8), ScratchReg0)
+        .addReg(ARM::R9)
+        .addImm(-8)
         .add(predOps(ARMCC::AL));
   } else {
     // Get TLS base address from the coprocessor
