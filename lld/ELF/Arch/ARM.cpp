@@ -44,6 +44,8 @@ public:
   bool inBranchRange(RelType type, uint64_t src, uint64_t dst) const override;
   void relocate(uint8_t *loc, const Relocation &rel,
                 uint64_t val) const override;
+  bool adjustPrologueForCrossSplitStack(uint8_t *loc, uint8_t *end,
+                                        uint8_t stOther) const override;
 };
 } // namespace
 
@@ -908,6 +910,11 @@ int64_t ARM::getImplicitAddend(const uint8_t *buf, RelType type) const {
     // These relocations are defined as not having an implicit addend.
     return 0;
   }
+}
+
+bool ARM::adjustPrologueForCrossSplitStack(uint8_t *loc, uint8_t *end,
+                                           uint8_t stOther) const {
+  return false;
 }
 
 TargetInfo *elf::getARMTargetInfo() {
